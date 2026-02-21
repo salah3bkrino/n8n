@@ -1,0 +1,162 @@
+name: Deploy n8n to Hostinger
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to Hostinger VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HOST_IP }}
+          username: ${{ secrets.HOST_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            mkdir -p /opt/n8n
+            cd /opt/n8n
+
+            # Create .env
+            echo "POSTGRES_USER=${{ secrets.POSTGRES_USER }}" > .env
+            echo "POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}" >> .env
+            echo "POSTGRES_DB=${{ secrets.POSTGRES_DB }}" >> .env
+            echo "REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}" >> .env
+            echo "N8N_ENCRYPTION_KEY=${{ secrets.N8N_ENCRYPTION_KEY }}" >> .env
+            echo "DOMAIN_NAME=${{ secrets.DOMAIN_NAME }}" >> .env
+            echo "SUBDOMAIN=${{ secrets.SUBDOMAIN }}" >> .env
+            echo "GENERIC_TIMEZONE=${{ secrets.GENERIC_TIMEZONE }}" >> .env
+            echo "GITHUB_REPOSITORY=${{ env.IMAGE_NAME }}" >> .env
+
+            # Create docker-compose.yaml
+            cat <<EOF > docker-compose.yaml
+            version: '3.8'
+
+            services:
+              postgres:
+                image: postgres:16-alpine
+                restart: always
+                environment:
+                  - POSTGRES_USER
+                  - POSTGRES_PASSWORD
+                  - POSTGRES_DB
+                volumes:
+                  - postgres_data:/var/lib/postgresql/data
+                healthcheck:
+                  test: ["CMD-SHELL", "pg_isready -h localhost -U \$\$POSTGRES_USER -d \$\$POSTGRES_DB"]
+                  interval: 5s
+                  timeout: 5s
+                  retries: 10
+
+              redis:
+                image: redis:6-alpine
+                restart: always
+                command: ["sh", "-c", "redis-server --requirepass \"\$REDIS_PASSWORD\""]
+                volumes:
+                  - redis_data:/data
+                healthcheck:
+                  test: ["CMD-SHELL", "redis-cli -a \$\$REDIS_PASSWORD ping | grep PONG"]
+                  interval: 5s
+                  timeout: 5s
+                  retries: 10
+
+              n8n:
+                image: ghcr.io/${{ env.IMAGE_NAME }}:latest
+                restart: always
+                environment:
+                  - DB_TYPE=postgresdb
+                  - DB_POSTGRESDB_HOST=postgres
+                  - DB_POSTGRESDB_PORT=5432
+                  - DB_POSTGRESDB_DATABASE=\${POSTGRES_DB}
+                  - DB_POSTGRESDB_USER=\${POSTGRES_USER}
+                  - DB_POSTGRESDB_PASSWORD=\${POSTGRES_PASSWORD}
+                  - N8N_ENCRYPTION_KEY
+                  - N8N_HOST=\${SUBDOMAIN}.\${DOMAIN_NAME}
+                  - N8N_PORT=5678
+                  - N8N_PROTOCOL=https
+                  - NODE_ENV=production
+                  - WEBHOOK_URL=https://\${SUBDOMAIN}.\${DOMAIN_NAME}/
+                  - GENERIC_TIMEZONE=\${GENERIC_TIMEZONE}
+                  - EXECUTIONS_MODE=queue
+                  - QUEUE_BULL_REDIS_HOST=redis
+                  - QUEUE_BULL_REDIS_PASSWORD=\${REDIS_PASSWORD}
+                ports:
+                  - "5678:5678"
+                volumes:
+                  - n8n_data:/home/node/.n8n
+                depends_on:
+                  postgres:
+                    condition: service_healthy
+                  redis:
+                    condition: service_healthy
+
+              worker:
+                image: ghcr.io/${{ env.IMAGE_NAME }}:latest
+                restart: always
+                command: worker
+                environment:
+                  - DB_TYPE=postgresdb
+                  - DB_POSTGRESDB_HOST=postgres
+                  - DB_POSTGRESDB_PORT=5432
+                  - DB_POSTGRESDB_DATABASE=\${POSTGRES_DB}
+                  - DB_POSTGRESDB_USER=\${POSTGRES_USER}
+                  - DB_POSTGRESDB_PASSWORD=\${POSTGRES_PASSWORD}
+                  - N8N_ENCRYPTION_KEY
+                  - NODE_ENV=production
+                  - EXECUTIONS_MODE=queue
+                  - QUEUE_BULL_REDIS_HOST=redis
+                  - QUEUE_BULL_REDIS_PASSWORD=\${REDIS_PASSWORD}
+                depends_on:
+                  postgres:
+                    condition: service_healthy
+                  redis:
+                    condition: service_healthy
+
+            volumes:
+              n8n_data:
+              postgres_data:
+              redis_data:
+            EOF
+
+            # Login to GHCR
+            echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Pull and Restart
+            docker compose pull
+            docker compose up -d
+            docker system prune -f
