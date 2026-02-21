@@ -29,10 +29,7 @@ services:
       retries: 10
 
   n8n:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: ghcr.io/${GITHUB_REPOSITORY}:latest
+    image: n8nio/n8n:latest
     restart: always
     environment:
       - DB_TYPE=postgresdb
@@ -62,7 +59,7 @@ services:
         condition: service_healthy
 
   worker:
-    image: ghcr.io/${GITHUB_REPOSITORY}:latest
+    image: n8nio/n8n:latest
     restart: always
     command: worker
     environment:
